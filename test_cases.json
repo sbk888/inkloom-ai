@@ -1,0 +1,66 @@
+[
+  {
+    "id": "TC-01",
+    "claim": "Our cream permanently removes acne.",
+    "approved_facts": ["Contains 2% niacinamide.", "Designed to improve skin appearance."],
+    "restrictions": ["Do not claim permanent acne removal.", "Do not make unsupported medical claims."],
+    "model_result": {"status": "Evidence found", "evidence": "Designed to improve skin appearance.", "restriction": "Do not claim permanent acne removal.", "risks": ["Absolute claim", "Health-related claim"]},
+    "expected_status": "Restricted claim"
+  },
+  {
+    "id": "TC-02",
+    "claim": "Our skincare product contains niacinamide.",
+    "approved_facts": ["Contains 2% niacinamide."],
+    "restrictions": ["Do not make unsupported medical claims."],
+    "model_result": {"status": "Evidence found", "evidence": "Contains 2% niacinamide.", "restriction": "", "risks": []},
+    "expected_status": "Evidence found"
+  },
+  {
+    "id": "TC-03",
+    "claim": "Our cream guarantees results in three days.",
+    "approved_facts": ["Suitable for daily skincare use."],
+    "restrictions": ["Do not guarantee results within a specific number of days."],
+    "model_result": {"status": "Restricted claim", "evidence": "", "restriction": "Do not guarantee results within a specific number of days.", "risks": ["Absolute claim", "Quantified claim"]},
+    "expected_status": "Restricted claim"
+  },
+  {
+    "id": "TC-04",
+    "claim": "Our product is the best in the market.",
+    "approved_facts": ["Suitable for daily skincare use."],
+    "restrictions": [],
+    "model_result": {"status": "Evidence found", "evidence": "Suitable for daily skincare use.", "restriction": "", "risks": ["Performance claim"]},
+    "expected_status": "Needs verification"
+  },
+  {
+    "id": "TC-05",
+    "claim": "Our product is clinically proven to cure acne.",
+    "approved_facts": ["Contains 2% niacinamide."],
+    "restrictions": ["Do not make unsupported medical claims."],
+    "model_result": {"status": "Restricted claim", "evidence": "", "restriction": "Do not make unsupported medical claims.", "risks": ["Health-related claim"]},
+    "expected_status": "Restricted claim"
+  },
+  {
+    "id": "TC-06",
+    "claim": "Enjoy a simple daily skincare routine.",
+    "approved_facts": ["Suitable for daily skincare use."],
+    "restrictions": [],
+    "model_result": {"status": "Evidence found", "evidence": "Suitable for daily skincare use.", "restriction": "", "risks": []},
+    "expected_status": "Evidence found"
+  },
+  {
+    "id": "TC-07",
+    "claim": "Our cream permanently removes acne.",
+    "approved_facts": ["Designed to improve skin appearance."],
+    "restrictions": ["Do not claim permanent acne removal."],
+    "model_result": {"status": "Restricted claim", "evidence": "invented evidence", "restriction": "Do not claim permanent acne removal.", "risks": ["Absolute claim"]},
+    "expected_status": "Restricted claim"
+  },
+  {
+    "id": "TC-08",
+    "claim": "Our formula delivers visible results.",
+    "approved_facts": ["Suitable for daily skincare use."],
+    "restrictions": [],
+    "model_result": {"status": "Evidence found", "evidence": "not in approved facts", "restriction": "", "risks": []},
+    "expected_status": "Unsupported claim"
+  }
+]

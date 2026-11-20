@@ -1,74 +1,33 @@
-
-import tomllib
+"""Offline regression tests for Inkloom's deterministic review guardrails."""
+import json
 from pathlib import Path
-
-from evidence_engine import (
-    create_client,
-    analyze_evidence
-)
+from verification import enforce_review_guardrails
 
 
-# Read API key from existing secrets file
-secrets_path = Path(".streamlit/secrets.toml")
+def run_tests():
+    cases_path = Path(__file__).with_name("test_cases.json")
+    cases = json.loads(cases_path.read_text(encoding="utf-8"))
+    passed = 0
+    failures = []
 
-with secrets_path.open("rb") as file:
-    secrets = tomllib.load(file)
-
-api_key = secrets["GEMINI_API_KEY"]
-
-client = create_client(api_key)
-
-
-approved_facts = [
-    "Contains 2% niacinamide.",
-    "Designed to improve skin appearance.",
-    "Suitable for daily skincare use."
-]
-
-restrictions = [
-    "Do not claim permanent acne removal.",
-    "Do not guarantee results within a specific number of days.",
-    "Do not make unsupported medical claims."
-]
-
-
-marketing_claims = [
-    "Our cream permanently removes acne.",
-    "Our skincare product contains niacinamide.",
-    "Our cream guarantees results in three days."
-]
-
-
-for claim in marketing_claims:
-
-    print("\n" + "=" * 55)
-
-    print("MARKETING CLAIM:")
-    print(claim)
-
-    result = analyze_evidence(
-        client,
-        claim,
-        approved_facts,
-        restrictions
-    )
-
-    print("\nAPPROVED EVIDENCE:")
-
-    for item in result["approved_evidence"]:
-        print(
-            item["similarity"],
-            "%",
-            item["text"]
+    for case in cases:
+        checked = enforce_review_guardrails(
+            case["model_result"],
+            case["approved_facts"],
+            case["restrictions"],
         )
+        actual = checked["status"]
+        if actual == case["expected_status"]:
+            passed += 1
+            print(f"PASS {case['id']}: {actual}")
+        else:
+            failures.append((case["id"], case["expected_status"], actual))
+            print(f"FAIL {case['id']}: expected {case['expected_status']}, got {actual}")
 
-    print("\nPOTENTIAL RESTRICTIONS:")
+    print(f"\nRegression tests: {passed}/{len(cases)} passed")
+    if failures:
+        raise SystemExit(1)
 
-    for item in result["restriction_matches"]:
-        print(
-            item["similarity"],
-            "%",
-            item["text"]
-        )
 
-print("\nPHASE 4 TEST COMPLETED!")
+if __name__ == "__main__":
+    run_tests()

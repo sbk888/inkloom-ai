@@ -3,6 +3,7 @@ import json
 import os
 import re
 import uuid
+import sqlite3
 from datetime import datetime
 
 import fitz
@@ -21,6 +22,7 @@ from reportlab.platypus import (
 from xml.sax.saxutils import escape
 
 from evidence_engine import analyze_evidence
+from verification import enforce_review_guardrails
 
 
 # ==========================================
@@ -84,6 +86,78 @@ def extract_text(uploaded_file):
         return file_bytes.decode("utf-8", errors="replace")
 
     return ""
+
+
+def build_source_records(uploaded_file, manual_text):
+    """Keep page/line provenance for each supplied guideline line."""
+    records = []
+    if uploaded_file is not None:
+        raw = uploaded_file.getvalue()
+        filename = uploaded_file.name
+        if filename.lower().endswith(".pdf"):
+            with fitz.open(stream=raw, filetype="pdf") as document:
+                for page_number, page in enumerate(document, start=1):
+                    page_text = page.get_text()
+                    if page_text.strip():
+                        records.append({
+                            "text": page_text, "source": filename,
+                            "location": f"Page {page_number}"
+                        })
+                    for line_number, line in enumerate(page_text.splitlines(), start=1):
+                        if line.strip():
+                            records.append({
+                                "text": line.strip(), "source": filename,
+                                "location": f"Page {page_number}, line {line_number}"
+                            })
+        elif filename.lower().endswith(".txt"):
+            text = raw.decode("utf-8", errors="replace")
+            if text.strip():
+                records.append({
+                    "text": text, "source": filename, "location": "Text document"
+                })
+            for line_number, line in enumerate(text.splitlines(), start=1):
+                if line.strip():
+                    records.append({
+                        "text": line.strip(), "source": filename,
+                        "location": f"Line {line_number}"
+                    })
+
+    for line_number, line in enumerate((manual_text or "").splitlines(), start=1):
+        if line.strip():
+            records.append({
+                "text": line.strip(), "source": "Manual guideline input",
+                "location": f"Line {line_number}"
+            })
+    return records
+
+
+def normalize_source_line(value):
+    return re.sub(r"\s+", " ", re.sub(r"^[-*•]\s*", "", str(value))).strip().casefold()
+
+
+def find_source_references(statement, source_records):
+    target = normalize_source_line(statement)
+    if not target:
+        return []
+    matches = []
+    for record in source_records or []:
+        record_text = normalize_source_line(record.get("text", ""))
+        if record_text == target or (len(target) >= 12 and target in record_text):
+            ref = {"source": record.get("source", "Guidelines"), "location": record.get("location", "") }
+            if ref not in matches:
+                matches.append(ref)
+    return matches
+
+
+def attach_source_traceability(results, source_records):
+    for result in results:
+        result["evidence_sources"] = find_source_references(result.get("evidence", ""), source_records)
+        result["restriction_sources"] = find_source_references(result.get("restriction", ""), source_records)
+        for match in result.get("approved_matches", []):
+            match["sources"] = find_source_references(match.get("text", ""), source_records)
+        for match in result.get("restriction_matches", []):
+            match["sources"] = find_source_references(match.get("text", ""), source_records)
+    return results
 
 
 # ==========================================
@@ -265,7 +339,7 @@ def basic_review(content, guidelines):
 # AI REVIEW + SEMANTIC RETRIEVAL
 # ==========================================
 
-def ai_review(content, guidelines):
+def ai_review(content, guidelines, source_records=None):
     client = get_gemini_client()
     if client is None:
         raise ValueError("Gemini API key not configured.")
@@ -398,7 +472,7 @@ If no actual restriction conflict exists, use an empty restriction string.
         if not isinstance(risks, list):
             risks = []
 
-        validated.append({
+        checked = enforce_review_guardrails({
             "sentence": sentence,
             "status": status,
             "risks": [str(risk) for risk in risks],
@@ -408,12 +482,13 @@ If no actual restriction conflict exists, use an empty restriction string.
             "suggestion": str(item.get("suggestion", "")),
             "approved_matches": matching_retrieval["approved_candidates"],
             "restriction_matches": matching_retrieval["restriction_candidates"]
-        })
+        }, approved, restrictions)
+        validated.append(checked)
 
     if not validated:
         raise ValueError("AI returned no valid sentence analysis.")
 
-    return validated
+    return attach_source_traceability(validated, source_records or [])
 
 
 # ==========================================
@@ -475,9 +550,55 @@ def create_audit_id():
     return "INK-" + uuid.uuid4().hex[:10].upper()
 
 
+REVIEW_DB_PATH = os.getenv("INKLOOM_REVIEW_DB", "inkloom_review_history.db")
+
+
+def init_review_db():
+    with sqlite3.connect(REVIEW_DB_PATH) as connection:
+        connection.execute("""
+            CREATE TABLE IF NOT EXISTS review_decisions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                report_id TEXT NOT NULL,
+                claim_index INTEGER NOT NULL,
+                claim_text TEXT NOT NULL,
+                decision TEXT NOT NULL,
+                edited_text TEXT,
+                reviewer_note TEXT,
+                updated_at TEXT NOT NULL,
+                UNIQUE(report_id, claim_index)
+            )
+        """)
+
+
+def save_review_decision(report_id, claim_index, claim_text, decision, edited_text, reviewer_note):
+    updated_at = datetime.now().astimezone().isoformat(timespec="seconds")
+    with sqlite3.connect(REVIEW_DB_PATH) as connection:
+        connection.execute("""
+            INSERT INTO review_decisions
+            (report_id, claim_index, claim_text, decision, edited_text, reviewer_note, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(report_id, claim_index) DO UPDATE SET
+                claim_text=excluded.claim_text, decision=excluded.decision,
+                edited_text=excluded.edited_text, reviewer_note=excluded.reviewer_note,
+                updated_at=excluded.updated_at
+        """, (report_id, claim_index, claim_text, decision, edited_text, reviewer_note, updated_at))
+
+
+def load_review_decisions(report_id):
+    init_review_db()
+    with sqlite3.connect(REVIEW_DB_PATH) as connection:
+        connection.row_factory = sqlite3.Row
+        rows = connection.execute(
+            "SELECT claim_index, claim_text, decision, edited_text, reviewer_note, updated_at "
+            "FROM review_decisions WHERE report_id=? ORDER BY claim_index",
+            (report_id,)
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
 def make_pdf_report(
     results, report_id, generated_at, brand_name,
-    mode_used, source_filename, guideline_text
+    mode_used, source_filename, guideline_text, review_decisions=None
 ):
     """Build a PDF audit report in memory and return its bytes."""
 
@@ -615,6 +736,10 @@ def make_pdf_report(
             para("Restriction: " + (result.get("restriction") or "No confirmed restriction recorded.")),
             para("Suggested action: " + result.get("suggestion", ""))
         ]
+        for source_ref in result.get("evidence_sources", []):
+            block.append(para(f"Approved evidence source: {source_ref.get('source')} — {source_ref.get('location')}", "Tiny"))
+        for source_ref in result.get("restriction_sources", []):
+            block.append(para(f"Restriction source: {source_ref.get('source')} — {source_ref.get('location')}", "Tiny"))
 
         approved_matches = result.get("approved_matches", [])
         restriction_matches = result.get("restriction_matches", [])
@@ -638,8 +763,17 @@ def make_pdf_report(
         block.append(Spacer(1, 3 * mm))
         story.append(KeepTogether(block))
 
+    if review_decisions:
+        story.append(Paragraph("4. Human review decisions", styles["SectionHeading"]))
+        for decision in review_decisions:
+            story.append(para(
+                f"Claim {decision.get('claim_index', 0) + 1}: {decision.get('decision', 'Pending')} | "
+                f"Reviewer note: {decision.get('reviewer_note', '')} | "
+                f"Edited text: {decision.get('edited_text', '') or 'Not supplied'}"
+            ))
+
     story.extend([
-        Paragraph("4. Source and interpretation notes", styles["SectionHeading"]),
+        Paragraph("5. Source and interpretation notes", styles["SectionHeading"]),
         para(
             "The findings in this report are AI-generated review assistance. "
             "Semantic similarity scores indicate retrieval relevance only; "
@@ -679,7 +813,7 @@ def make_pdf_report(
     return buffer.getvalue()
 
 
-def make_text_report(results, report_id, generated_at, brand_name, mode_used):
+def make_text_report(results, report_id, generated_at, brand_name, mode_used, review_decisions=None):
     total = len(results)
     statuses = [
         "Evidence found", "Restricted claim",
@@ -730,6 +864,15 @@ def make_text_report(results, report_id, generated_at, brand_name, mode_used):
 
         lines.extend(["-" * 65, ""])
 
+    if review_decisions:
+        lines.extend(["", "HUMAN REVIEW DECISIONS", ""])
+        for decision in review_decisions:
+            lines.append(
+                f"Claim {decision.get('claim_index', 0) + 1}: {decision.get('decision', 'Pending')} | "
+                f"Note: {decision.get('reviewer_note', '')} | "
+                f"Edited: {decision.get('edited_text', '')}"
+            )
+
     lines.extend([
         "NOTE: Similarity scores indicate retrieval relevance, not proof.",
         "AI-generated findings require human verification."
@@ -740,6 +883,11 @@ def make_text_report(results, report_id, generated_at, brand_name, mode_used):
 # ==========================================
 # MAIN USER INTERFACE
 # ==========================================
+
+try:
+    init_review_db()
+except Exception as database_error:
+    st.warning(f"Review history storage is unavailable: {database_error}")
 
 st.title("INKLOOM AI")
 st.caption("Evidence-Grounded Brand Content Review Platform")
@@ -838,6 +986,9 @@ analysis_mode = st.radio(
 # ANALYZE BUTTON
 # ==========================================
 
+source_records = build_source_records(uploaded_file, manual_guidelines)
+
+
 if st.button(
     "Analyze Marketing Content",
     type="primary",
@@ -851,10 +1002,11 @@ if st.button(
         try:
             with st.spinner("Inkloom is analyzing your content..."):
                 if analysis_mode == "AI Semantic Analysis":
-                    results = ai_review(marketing_content, guidelines)
+                    results = ai_review(marketing_content, guidelines, source_records)
                     mode_used = "Gemini AI + Semantic Retrieval"
                 else:
                     results = basic_review(marketing_content, guidelines)
+                    results = attach_source_traceability(results, source_records)
                     mode_used = "Rule-based engine"
 
             report_id = create_audit_id()
@@ -873,6 +1025,7 @@ if st.button(
             st.session_state["source_filename"] = (
                 uploaded_file.name if uploaded_file else "Manual input"
             )
+            st.session_state["source_records"] = source_records
 
             st.success("Content analysis completed!")
         except Exception as error:
@@ -955,6 +1108,8 @@ if "results" in st.session_state:
                     st.write(
                         f"- {match['text']} ({match['similarity']}% similarity)"
                     )
+                    for source_ref in match.get("sources", []):
+                        st.caption(f"Source: {source_ref['source']} — {source_ref['location']}")
             else:
                 st.write("No relevant approved facts retrieved.")
 
@@ -965,6 +1120,8 @@ if "results" in st.session_state:
                     st.write(
                         f"- {match['text']} ({match['similarity']}% similarity)"
                     )
+                    for source_ref in match.get("sources", []):
+                        st.caption(f"Source: {source_ref['source']} — {source_ref['location']}")
             else:
                 st.write("No relevant restrictions retrieved.")
 
@@ -975,6 +1132,64 @@ if "results" in st.session_state:
 
             st.write("**Suggested improvement**")
             st.write(result["suggestion"])
+
+            st.write("**Evidence traceability**")
+            evidence_sources = result.get("evidence_sources", [])
+            restriction_sources = result.get("restriction_sources", [])
+            if evidence_sources:
+                for source_ref in evidence_sources:
+                    st.caption(f"Approved fact source: {source_ref['source']} — {source_ref['location']}")
+            elif result.get("evidence"):
+                st.caption("Evidence text was selected, but its exact source location could not be mapped.")
+            if restriction_sources:
+                for source_ref in restriction_sources:
+                    st.caption(f"Restriction source: {source_ref['source']} — {source_ref['location']}")
+            elif result.get("restriction"):
+                st.caption("Restriction text was selected, but its exact source location could not be mapped.")
+            if not evidence_sources and not restriction_sources:
+                st.caption("No exact source location was mapped for this finding.")
+
+            checks = result.get("verification_checks", {})
+            if checks:
+                with st.expander("Verification guardrail checks"):
+                    st.write(f"Exact approved evidence: {'Pass' if checks.get('exact_approved_evidence') else 'Not established'}")
+                    st.write(f"Exact restriction match: {'Pass' if checks.get('exact_restriction_match') else 'Not established'}")
+                    st.write(f"Risk flags present: {'Yes' if checks.get('risk_flags_present') else 'No'}")
+                    st.caption(checks.get("guardrail_note", ""))
+
+            st.write("**Human review decision**")
+            current_decisions = load_review_decisions(st.session_state["report_id"])
+            existing_decision = next((d for d in current_decisions if d["claim_index"] == index), {})
+            with st.form(key=f"review_form_{st.session_state['report_id']}_{index}"):
+                decision_value = st.selectbox(
+                    "Reviewer decision",
+                    ["Pending", "Approved", "Rejected", "Edited"],
+                    index=["Pending", "Approved", "Rejected", "Edited"].index(existing_decision.get("decision", "Pending"))
+                )
+                edited_value = st.text_area(
+                    "Edited claim (required when decision is Edited)",
+                    value=existing_decision.get("edited_text", "") or "",
+                    key=f"edited_claim_{st.session_state['report_id']}_{index}"
+                )
+                note_value = st.text_area(
+                    "Reviewer note",
+                    value=existing_decision.get("reviewer_note", "") or "",
+                    key=f"review_note_{st.session_state['report_id']}_{index}"
+                )
+                save_decision = st.form_submit_button("Save human review decision")
+            if save_decision:
+                if decision_value == "Edited" and not edited_value.strip():
+                    st.error("Please enter the edited claim before saving an Edited decision.")
+                else:
+                    try:
+                        save_review_decision(
+                            st.session_state["report_id"], index, result["sentence"],
+                            decision_value, edited_value.strip(), note_value.strip()
+                        )
+                        st.success("Human review decision saved.")
+                        st.rerun()
+                    except Exception as error:
+                        st.error(f"Could not save review decision: {error}")
 
             if st.button(
                 "Generate AI Rewrite",
@@ -1027,6 +1242,8 @@ if "results" in st.session_state:
     )
 
     try:
+        review_decisions = load_review_decisions(report_id)
+        st.caption(f"Human review decisions saved: {len(review_decisions)} / {len(results)}")
         pdf_bytes = make_pdf_report(
             results=results,
             report_id=report_id,
@@ -1034,7 +1251,8 @@ if "results" in st.session_state:
             brand_name=brand_name,
             mode_used=mode_used,
             source_filename=source_filename,
-            guideline_text=guideline_text
+            guideline_text=guideline_text,
+            review_decisions=review_decisions
         )
 
         col_pdf, col_txt = st.columns(2)
@@ -1047,7 +1265,8 @@ if "results" in st.session_state:
         )
 
         text_report = make_text_report(
-            results, report_id, generated_at, brand_name, mode_used
+            results, report_id, generated_at, brand_name, mode_used,
+            review_decisions=review_decisions
         )
         col_txt.download_button(
             "Download TXT Report",
@@ -1056,6 +1275,14 @@ if "results" in st.session_state:
             mime="text/plain",
             use_container_width=True
         )
+        if review_decisions:
+            st.download_button(
+                "Export Human Review History (JSON)",
+                data=json.dumps(review_decisions, indent=2, ensure_ascii=False),
+                file_name=f"inkloom_review_history_{report_id}.json",
+                mime="application/json"
+            )
+        st.caption("Review decisions are stored in the app's local SQLite database. On Streamlit Community Cloud, local storage may reset when the app is restarted or redeployed; download the review history to retain a copy.")
     except Exception as error:
         st.error(f"Could not generate the PDF report: {error}")
 
@@ -1069,5 +1296,6 @@ st.caption("INKLOOM AI | Evidence-Grounded Brand Content Review")
 st.caption(
     "AI-generated findings and suggestions require human verification. "
     "Similarity or AI assessments do not independently prove the factual "
-    "accuracy of a marketing claim."
+    "accuracy of a marketing claim. Reviewer decisions remain the final "
+    "human-controlled step."
 )
